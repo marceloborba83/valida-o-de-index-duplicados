@@ -1,0 +1,1 @@
+Este script analisa os índices do banco de dados, identificando índices redundantes ou não utilizados e fornecendo comandos para remoção e reversão seguras. Ele também resume as possíveis economias de espaço e operações de gravação desnecessárias.
