@@ -1,0 +1,267 @@
+
+USE db_MEU_BANCO; -- Ajuste para o banco desejado
+GO
+
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+GO
+
+DECLARE @StartTime DATETIME;
+DECLARE @DiasOnline INT;
+
+-- Obtém o início do serviço via tempdb (compatível com SQL 2005 até 2022+)
+SELECT @StartTime = create_date
+FROM sys.databases
+WHERE name = 'tempdb';
+
+SET @DiasOnline = DATEDIFF(DAY, @StartTime, GETDATE());
+
+/* ==============================================================================
+   PASSO 1: UPTIME E SEMÁFORO GERAL DA INSTÂNCIA
+   ============================================================================== */
+SELECT
+    @StartTime AS [Servidor_Online_Desde],
+    @DiasOnline AS [Dias_Online],
+    DATEDIFF(HOUR, @StartTime, GETDATE()) AS [Horas_Online],
+    CASE
+        WHEN @DiasOnline < 7
+            THEN 'ALERTA: Uptime < 7 dias. Risco de falso positivo para rotinas esporádicas.'
+        WHEN @DiasOnline BETWEEN 7 AND 14
+            THEN 'MODERADO: Uptime entre 7 e 14 dias. Seguro apenas para DUPLICADOS EXATOS.'
+        WHEN @DiasOnline BETWEEN 15 AND 30
+            THEN 'SEGURO: Uptime entre 15 e 30 dias. Amostragem representativa do ciclo quinzenal.'
+        ELSE
+            'TOTALMENTE SEGURO: Uptime > 30 dias. Amostragem completa cobrindo fechamentos mensais.'
+    END AS [Status_Amostragem_Instancia];
+
+/* ==============================================================================
+   PASSO 2: RELATÓRIO DETALHADO DE ÍNDICES REDUNDANTES / SEM USO + ROLLBACK
+   ============================================================================== */
+;WITH IndexData AS (
+    SELECT
+        s.name AS [Schema_Name],
+        t.name AS [Table_Name],
+        i.object_id,
+        i.index_id,
+        i.name AS [Index_Name],
+        i.is_primary_key,
+        i.is_unique,
+        i.is_unique_constraint,
+
+        -- Chaves ordenadas
+        STUFF((
+            SELECT ', ' + c.name
+            FROM sys.index_columns ic
+            JOIN sys.columns c
+                ON c.object_id = ic.object_id
+               AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id
+              AND ic.index_id = i.index_id
+              AND ic.is_included_column = 0
+            ORDER BY ic.key_ordinal
+            FOR XML PATH('')
+        ), 1, 2, '') AS [Key_Columns],
+
+        -- Includes ordenados
+        ISNULL(STUFF((
+            SELECT ', ' + c.name
+            FROM sys.index_columns ic
+            JOIN sys.columns c
+                ON c.object_id = ic.object_id
+               AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id
+              AND ic.index_id = i.index_id
+              AND ic.is_included_column = 1
+            ORDER BY c.name
+            FOR XML PATH('')
+        ), 1, 2, ''), '') AS [Included_Columns],
+
+        -- Métricas de uso
+        ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) AS [Total_Reads],
+        ISNULL(us.user_updates, 0) AS [User_Updates],
+        ISNULL(sz.Size_MB, 0) AS [Size_MB]
+
+    FROM sys.indexes i
+    INNER JOIN sys.tables t
+        ON t.object_id = i.object_id
+    INNER JOIN sys.schemas s
+        ON s.schema_id = t.schema_id
+    LEFT JOIN sys.dm_db_index_usage_stats us
+        ON us.database_id = DB_ID()
+       AND us.object_id = i.object_id
+       AND us.index_id = i.index_id
+    LEFT JOIN (
+        SELECT
+            object_id,
+            index_id,
+            CAST(SUM(used_page_count) * 8.0 / 1024 AS DECIMAL(18, 2)) AS [Size_MB]
+        FROM sys.dm_db_partition_stats
+        GROUP BY object_id, index_id
+    ) sz
+        ON sz.object_id = i.object_id
+       AND sz.index_id = i.index_id
+    WHERE t.is_ms_shipped = 0
+      AND i.type_desc = 'NONCLUSTERED'
+      AND i.is_hypothetical = 0
+      AND i.is_disabled = 0
+)
+SELECT
+    idx_ruim.Schema_Name + '.' + idx_ruim.Table_Name AS [Tabela],
+    idx_ruim.Index_Name AS [Indice_Sem_Uso],
+
+    -- 1. Decisão Operacional
+    CASE
+        WHEN @DiasOnline >= 15
+            THEN 'SIM (Amostragem Segura)'
+        WHEN @DiasOnline >= 7
+         AND idx_ruim.Key_Columns = idx_bom.Key_Columns
+         AND idx_ruim.Included_Columns = idx_bom.Included_Columns
+            THEN 'SIM (Duplicado Idêntico)'
+        WHEN @DiasOnline BETWEEN 7 AND 14
+            THEN 'COM CAUTELA (Validar se atende rotina mensal)'
+        ELSE
+            'NÃO (Aguardar mais dias de Uptime)'
+    END AS [Pode_Seguir_Com_Exclusao],
+
+    -- 2. DDL Pronto para Drop
+    'DROP INDEX [' + idx_ruim.Index_Name + '] ON [' +
+        idx_ruim.Schema_Name + '].[' + idx_ruim.Table_Name + '];'
+        AS [Comando_DROP],
+
+    -- 3. DDL Dinâmico para Desfazer a Ação (ROLLBACK)
+    'CREATE NONCLUSTERED INDEX [' + idx_ruim.Index_Name + '] ON [' + 
+        idx_ruim.Schema_Name + '].[' + idx_ruim.Table_Name + '] (' + idx_ruim.Key_Columns + ')' +
+        CASE 
+            WHEN idx_ruim.Included_Columns <> '' THEN ' INCLUDE (' + idx_ruim.Included_Columns + ')'
+            ELSE ''
+        END + ';' AS [Comando_ROLLBACK_Recriar],
+
+    -- 4. Diagnóstico
+    CASE
+        WHEN idx_ruim.Key_Columns = idx_bom.Key_Columns
+         AND idx_ruim.Included_Columns = idx_bom.Included_Columns
+            THEN '1. DUPLICADO EXATO (Mesmas Chaves e Includes)'
+        WHEN idx_ruim.Key_Columns = idx_bom.Key_Columns
+         AND (
+             idx_ruim.Included_Columns = ''
+             OR (', ' + idx_bom.Included_Columns + ', ')
+                LIKE ('%, ' + idx_ruim.Included_Columns + ', %')
+         )
+            THEN '2. REDUNDANTE (Mesma Chave, Menos Includes)'
+        WHEN (', ' + idx_bom.Key_Columns + ', ')
+             LIKE (', ' + idx_ruim.Key_Columns + ', %')
+            THEN '3. REDUNDANTE (Prefixo de Chave)'
+        ELSE '4. REDUNDANTE'
+    END AS [Diagnostico],
+
+    idx_ruim.Total_Reads AS [Total_Leituras],
+    idx_ruim.User_Updates AS [Escritas_Desperdicadas],
+    idx_ruim.Size_MB AS [Espaco_MB],
+    idx_ruim.Key_Columns AS [Chaves_Indice_Sem_Uso],
+    ISNULL(NULLIF(idx_ruim.Included_Columns, ''), '(Nenhum)') AS [Includes_Indice_Sem_Uso],
+
+    idx_bom.Index_Name AS [Indice_Que_Cobre],
+    idx_bom.Total_Reads AS [Leituras_Do_Indice_Que_Cobre],
+    idx_bom.Key_Columns AS [Chaves_Indice_Que_Cobre]
+
+FROM IndexData idx_ruim
+INNER JOIN IndexData idx_bom
+    ON idx_ruim.object_id = idx_bom.object_id
+   AND idx_ruim.index_id <> idx_bom.index_id
+WHERE
+    idx_ruim.is_primary_key = 0
+    AND idx_ruim.is_unique = 0
+    AND idx_ruim.is_unique_constraint = 0
+    AND idx_ruim.Total_Reads = 0
+    AND (
+        idx_ruim.Key_Columns = idx_bom.Key_Columns
+        OR (', ' + idx_bom.Key_Columns + ', ')
+           LIKE (', ' + idx_ruim.Key_Columns + ', %')
+    )
+ORDER BY
+    idx_ruim.User_Updates DESC,
+    idx_ruim.Size_MB DESC;
+
+/* ==============================================================================
+   PASSO 3: RESUMO EXECUTIVO DE GANHO DE ESPAÇO E I/O
+   ============================================================================== */
+;WITH IndexData AS (
+    SELECT
+        i.object_id,
+        i.index_id,
+        i.name AS [Index_Name],
+        i.is_primary_key,
+        i.is_unique,
+        i.is_unique_constraint,
+
+        STUFF((
+            SELECT ', ' + c.name
+            FROM sys.index_columns ic
+            JOIN sys.columns c
+                ON c.object_id = ic.object_id
+               AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id
+              AND ic.index_id = i.index_id
+              AND ic.is_included_column = 0
+            ORDER BY ic.key_ordinal
+            FOR XML PATH('')
+        ), 1, 2, '') AS [Key_Columns],
+
+        ISNULL(STUFF((
+            SELECT ', ' + c.name
+            FROM sys.index_columns ic
+            JOIN sys.columns c
+                ON c.object_id = ic.object_id
+               AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id
+              AND ic.index_id = i.index_id
+              AND ic.is_included_column = 1
+            ORDER BY c.name
+            FOR XML PATH('')
+        ), 1, 2, ''), '') AS [Included_Columns],
+
+        ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) AS [Total_Reads],
+        ISNULL(us.user_updates, 0) AS [User_Updates],
+        ISNULL(sz.Size_MB, 0) AS [Size_MB]
+
+    FROM sys.indexes i
+    INNER JOIN sys.tables t
+        ON t.object_id = i.object_id
+    LEFT JOIN sys.dm_db_index_usage_stats us
+        ON us.database_id = DB_ID()
+       AND us.object_id = i.object_id
+       AND us.index_id = i.index_id
+    LEFT JOIN (
+        SELECT
+            object_id,
+            index_id,
+            CAST(SUM(used_page_count) * 8.0 / 1024 AS DECIMAL(18, 2)) AS [Size_MB]
+        FROM sys.dm_db_partition_stats
+        GROUP BY object_id, index_id
+    ) sz
+        ON sz.object_id = i.object_id
+       AND sz.index_id = i.index_id
+    WHERE t.is_ms_shipped = 0
+      AND i.type_desc = 'NONCLUSTERED'
+      AND i.is_hypothetical = 0
+      AND i.is_disabled = 0
+)
+SELECT 
+    COUNT(DISTINCT idx_ruim.Index_Name) AS [Qtd_Indices_Redundantes],
+    CAST(SUM(idx_ruim.Size_MB) AS DECIMAL(18,2)) AS [Ganho_Espaco_Total_MB],
+    CAST(SUM(idx_ruim.Size_MB) / 1024.0 AS DECIMAL(18, 2)) AS [Ganho_Espaco_Total_GB],
+    CAST(SUM(idx_ruim.Size_MB) / 1024.0 / 1024.0 AS DECIMAL(18, 2)) AS [Ganho_Espaco_Total_TB],
+    SUM(idx_ruim.User_Updates) AS [Total_Escritas_Desperdicadas_Evitadas]
+FROM IndexData idx_ruim
+INNER JOIN IndexData idx_bom 
+    ON idx_ruim.object_id = idx_bom.object_id
+   AND idx_ruim.index_id <> idx_bom.index_id
+WHERE 
+    idx_ruim.is_primary_key = 0
+    AND idx_ruim.is_unique = 0
+    AND idx_ruim.is_unique_constraint = 0
+    AND idx_ruim.Total_Reads = 0
+    AND (
+        idx_ruim.Key_Columns = idx_bom.Key_Columns
+        OR (', ' + idx_bom.Key_Columns + ', ') LIKE (', ' + idx_ruim.Key_Columns + ', %')
+    );
+GO
